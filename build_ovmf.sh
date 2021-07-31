@@ -28,13 +28,13 @@
 
 gop_bin_dir="./gop"
 podman_image_name="ubuntu:ovmf.18.04"
+podman_qemu_image_name="ubuntu:ovmf.qemu.20.04"
 proxy_conf="proxy.conf"
 branch=""
 secureboot=""
 
 if [ ! -x "$(command -v podman)" ]; then
-    echo "Install Docker first:"
-    echo "If you are using Ubuntu, you can refer to: https://docs.docker.com/engine/install/ubuntu/"
+    echo "Install Podman first:"
     exit
 fi
 
@@ -63,7 +63,7 @@ usage()
     echo "$0 [-v ver] [-i] [-s] [-h]"
     echo "  -b branch/tag: checkout branch/tag instead of leaving it as default"
     echo "  -i:     Delete the existing docker image ${docker_image_name} and re-create it"
-    echo "  -s:     Delete the existing edk2 source code and re-download/re-patch it"
+    echo "  -s:     Delete the existing edk2 source code and re-download it"
     echo "  -S:     Build vanilla secure boot ovmf instead of intel gop"
     echo "  -h:     Show this help"
     exit
@@ -103,6 +103,7 @@ if [[ "${re_create_image}" -eq 1 ]]; then
         echo "Deleting the old Docker image ${podman_image_name}  ..."
         echo "===================================================================="
         podman image rm -f "${podman_image_name}"
+        podman image rm -f "${podman_qemu_image_name}"
     fi
 fi
 
@@ -153,7 +154,7 @@ FROM ubuntu:18.04
 WORKDIR /root/acrn
 
 COPY ${proxy_conf} /etc/apt/apt.conf.d/proxy.conf
-RUN apt update && apt install -y gcc-5 g++-5 make nano git python uuid-dev nasm iasl
+RUN apt update && apt install -y gcc-5 g++-5 make nano git python uuid-dev nasm iasl dosfstools genisoimage mtools
 RUN ln -s /usr/bin/gcc-5 /usr/bin/gcc; ln -s /usr/bin/gcc-5 /usr/bin/cc; ln -s /usr/bin/g++-5 /usr/bin/g++; ln -s /usr/bin/gcc-ar-5 /usr/bin/gcc-ar
 EOF
 
@@ -161,14 +162,35 @@ EOF
     rm Dockerfile.ovmf
 }
 
+create_podman_qemu_image()
+{
+    echo "===================================================================="
+    echo "Creating Docker image ..."
+    echo "===================================================================="
+
+    cat > Dockerfile.ovmf <<EOF
+FROM ubuntu:20.04
+
+COPY ${proxy_conf} /etc/apt/apt.conf.d/proxy.conf
+RUN apt update && apt install -y dosfstools genisoimage mtools python3 qemu-system-x86
+EOF
+
+    podman build -t "${podman_qemu_image_name}" -f Dockerfile.ovmf .
+    rm Dockerfile.ovmf
+}
+
 if [[ "$(podman images -q ${podman_image_name} 2> /dev/null)" == "" ]]; then
     create_podman_image
+fi
+
+if [[ "$(podman images -q ${podman_qemu_image_name=} 2> /dev/null)" == "" ]] && [ -n "$secureboot" ] ; then
+    create_podman_qemu_image
 fi
 
 if [ ! -d edk2 ]; then
     create_edk2_workspace
     if [ $? -ne 0 ]; then
-        echo "Download/patch edk2 failed"
+        echo "Download edk2 failed"
         exit
     fi
 else
@@ -180,24 +202,23 @@ cp -f ../${gop_bin_dir}/Vbt.bin OvmfPkg/Vbt/Vbt.bin
 
 source edksetup.sh
 
-sed -i 's:^ACTIVE_PLATFORM\s*=\s*\w*/\w*\.dsc*:ACTIVE_PLATFORM       = OvmfPkg/OvmfPkgX64.dsc:g' Conf/target.txt
-sed -i 's:^TARGET_ARCH\s*=\s*\w*:TARGET_ARCH           = X64:g' Conf/target.txt
-sed -i 's:^TOOL_CHAIN_TAG\s*=\s*\w*:TOOL_CHAIN_TAG        = GCC5:g' Conf/target.txt
+sed -i "s:^ACTIVE_PLATFORM\s*=\s*\w*/\w*\.dsc*:ACTIVE_PLATFORM       = OvmfPkg/OvmfPkgX64.dsc:g" Conf/target.txt
+sed -i "s:^TARGET_ARCH\s*=\s*\w*:TARGET_ARCH           = X64:g" Conf/target.txt
+sed -i "s:^TOOL_CHAIN_TAG\s*=\s*\w*:TOOL_CHAIN_TAG        = GCC5:g" Conf/target.txt
 
 cd ..
 
-OVMF_FLAGS="-DDEBUG_ON_SERIAL_PORT=TRUE"
-OVMF_FLAGS="$OVMF_FLAGS -DNETWORK_IP6_ENABLE -DNETWORK_HTTP_BOOT_ENABLE -DNETWORK_TLS_ENABLE"
+OVMF_FLAGS="-DNETWORK_IP6_ENABLE -DNETWORK_HTTP_BOOT_ENABLE -DNETWORK_TLS_ENABLE"
+OVMF_FLAGS="$OVMF_FLAGS -DFD_SIZE_4MB"
+#OVMF_FLAGS="$OVMF_FLAGS -DDEBUG_ON_SERIAL_PORT=TRUE"
+
 
 SECURE_BOOT=""
 if [ -n "$secureboot" ]
 then
-	OVMF_FLAGS="$OVMF_FLAGS -DFD_SIZE_4MB"
 	SECURE_BOOT="-DSECURE_BOOT_ENABLE -DSMM_REQUIRE -DEXCLUDE_SHELL_FROM_FD"
 	SECURE_BOOT="$SECURE_BOOT -DTPM_ENABLE"
 	SECURE_BOOT="$SECURE_BOOT -a IA32 -a X64 -p OvmfPkg/OvmfPkgIa32X64.dsc"
-else
-	OVMF_FLAGS="$OVMF_FLAGS -DFD_SIZE_2MB"
 fi
 
 podman run \
@@ -207,3 +228,72 @@ podman run \
     -v $PWD:$PWD \
     ${podman_image_name} \
     /bin/bash -c "source edksetup.sh && make -C BaseTools && build $OVMF_FLAGS $SECURE_BOOT"
+
+if [ -n "$secureboot" ]
+then
+podman run \
+    -it \
+    --rm \
+    -w $PWD/edk2 \
+    -v $PWD:$PWD \
+    -v ./RedHatSecureBootPkKek1.pem:/RedHatSecureBootPkKek1.pem:ro \
+	-v ./ovmf-vars-generator:/ovmf-vars-generator:ro \
+    ${podman_qemu_image_name} \
+    /bin/bash -c '
+build_iso() {
+    dir="$1"
+    UEFI_SHELL_BINARY=${dir}/Shell.efi
+    ENROLLER_BINARY=${dir}/EnrollDefaultKeys.efi
+    UEFI_SHELL_IMAGE=uefi_shell.img
+    ISO_IMAGE=${dir}/UefiShell.iso
+
+    UEFI_SHELL_BINARY_BNAME=$(basename -- "$UEFI_SHELL_BINARY")
+    UEFI_SHELL_SIZE=$(stat --format=%s -- "$UEFI_SHELL_BINARY")
+    ENROLLER_SIZE=$(stat --format=%s -- "$ENROLLER_BINARY")
+
+    # add 1MB then 10% for metadata
+    UEFI_SHELL_IMAGE_KB=$((
+    (UEFI_SHELL_SIZE + ENROLLER_SIZE + 1 * 1024 * 1024) * 11 / 10 / 1024
+    ))
+
+    # create non-partitioned FAT image
+    rm -f -- "$UEFI_SHELL_IMAGE"
+    mkdosfs -C "$UEFI_SHELL_IMAGE" -n UEFI_SHELL -- "$UEFI_SHELL_IMAGE_KB"
+
+    # copy the shell binary into the FAT image
+    export MTOOLS_SKIP_CHECK=1
+    mmd   -i "$UEFI_SHELL_IMAGE"                       ::efi
+    mmd   -i "$UEFI_SHELL_IMAGE"                       ::efi/boot
+    mcopy -i "$UEFI_SHELL_IMAGE"  "$UEFI_SHELL_BINARY" ::efi/boot/bootx64.efi
+    mcopy -i "$UEFI_SHELL_IMAGE"  "$ENROLLER_BINARY"   ::
+    mdir  -i "$UEFI_SHELL_IMAGE"  -/                   ::
+
+    # build ISO with FAT image file as El Torito EFI boot image
+    mkisofs -input-charset ASCII -J -rational-rock \
+    -e "$UEFI_SHELL_IMAGE" -no-emul-boot \
+    -o "$ISO_IMAGE" "$UEFI_SHELL_IMAGE"
+}
+
+build_iso Build/Ovmf3264/DEBUG_GCC5/X64
+
+sed \
+    -e "s/^-----BEGIN CERTIFICATE-----$/4e32566d-8e9e-4f52-81d3-5bb9715f9727:/" \
+    -e "/^-----END CERTIFICATE-----$/d" \
+    /RedHatSecureBootPkKek1.pem \
+    > PkKek1.oemstr
+
+if [ -e Build/Ovmf3264/DEBUG_GCC5/FV/OVMF_VARS.enrolled.fd ]
+then
+    rm Build/Ovmf3264/DEBUG_GCC5/FV/OVMF_VARS.enrolled.fd
+fi
+python3 /ovmf-vars-generator --verbose --verbose \
+    --qemu-binary        /usr/bin/qemu-system-x86_64 \
+    --ovmf-binary        Build/Ovmf3264/DEBUG_GCC5/FV/OVMF_CODE.fd \
+    --ovmf-template-vars Build/Ovmf3264/DEBUG_GCC5/FV/OVMF_VARS.fd \
+    --uefi-shell-iso     Build/Ovmf3264/DEBUG_GCC5/X64/UefiShell.iso \
+    --oem-string         "$(< PkKek1.oemstr)" \
+    --skip-testing \
+    --print-output \
+    Build/Ovmf3264/DEBUG_GCC5/FV/OVMF_VARS.enrolled.fd
+'
+fi
