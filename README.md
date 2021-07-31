@@ -6,6 +6,8 @@ modified from https://projectacrn.github.io/latest/_static/downloads/build_acrn_
 
 secure boot building steps, ovmf-vars-generator and RedHatSecureBootPkKek1.pem obtained from https://src.fedoraproject.org/rpms/edk2
 
+requires podman
+
 ### usage:
 ```
 git clone https://github.com/Kethen/edk2-build-intel-gop
