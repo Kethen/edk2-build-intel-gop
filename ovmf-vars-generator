@@ -1,0 +1,295 @@
+#!/bin/python3
+# Copyright (C) 2017 Red Hat
+# Authors:
+# - Patrick Uiterwijk <puiterwijk@redhat.com>
+# - Kashyap Chamarthy <kchamart@redhat.com>
+#
+# Licensed under MIT License, for full text see LICENSE
+#
+# Purpose: Launch a QEMU guest and enroll ithe UEFI keys into an OVMF
+#          variables ("VARS") file.  Then boot a Linux kernel with QEMU.
+#          Finally, perform a check to verify if Secure Boot
+#          is enabled.
+
+from __future__ import print_function
+
+import argparse
+import os
+import logging
+import tempfile
+import shutil
+import string
+import subprocess
+
+
+def strip_special(line):
+    return ''.join([c for c in str(line) if c in string.printable])
+
+
+def generate_qemu_cmd(args, readonly, *extra_args):
+    if args.disable_smm:
+        machinetype = 'pc'
+    else:
+        machinetype = 'q35,smm=on'
+    machinetype += ',accel=%s' % ('kvm' if args.enable_kvm else 'tcg')
+
+    if args.oem_string is None:
+        oemstrings = []
+    else:
+        oemstring_values = [
+            ",value=" + s.replace(",", ",,") for s in args.oem_string ]
+        oemstrings = [
+            '-smbios',
+            "type=11" + ''.join(oemstring_values) ]
+
+    return [
+        args.qemu_binary,
+        '-machine', machinetype,
+        '-display', 'none',
+        '-no-user-config',
+        '-nodefaults',
+        '-m', '768',
+        '-smp', '2,sockets=2,cores=1,threads=1',
+        '-chardev', 'pty,id=charserial1',
+        '-device', 'isa-serial,chardev=charserial1,id=serial1',
+        '-global', 'driver=cfi.pflash01,property=secure,value=%s' % (
+            'off' if args.disable_smm else 'on'),
+        '-drive',
+        'file=%s,if=pflash,format=raw,unit=0,readonly=on' % (
+            args.ovmf_binary),
+        '-drive',
+        'file=%s,if=pflash,format=raw,unit=1,readonly=%s' % (
+            args.out_temp, 'on' if readonly else 'off'),
+        '-serial', 'stdio'] + oemstrings + list(extra_args)
+
+
+def download(url, target, suffix, no_download):
+    istemp = False
+    if target and os.path.exists(target):
+        return target, istemp
+    if not target:
+        temped = tempfile.mkstemp(prefix='qosb.', suffix='.%s' % suffix)
+        os.close(temped[0])
+        target = temped[1]
+        istemp = True
+    if no_download:
+        raise Exception('%s did not exist, but downloading was disabled' %
+                        target)
+    import requests
+    logging.debug('Downloading %s to %s', url, target)
+    r = requests.get(url, stream=True)
+    with open(target, 'wb') as f:
+        for chunk in r.iter_content(chunk_size=1024):
+            if chunk:
+                f.write(chunk)
+    return target, istemp
+
+
+def enroll_keys(args):
+    shutil.copy(args.ovmf_template_vars, args.out_temp)
+
+    logging.info('Starting enrollment')
+
+    cmd = generate_qemu_cmd(
+        args,
+        False,
+        '-drive',
+        'file=%s,format=raw,if=none,media=cdrom,id=drive-cd1,'
+        'readonly=on' % args.uefi_shell_iso,
+        '-device',
+        'ide-cd,drive=drive-cd1,id=cd1,'
+        'bootindex=1')
+    p = subprocess.Popen(cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT)
+    logging.info('Performing enrollment')
+    # Wait until the UEFI shell starts (first line is printed)
+    read = p.stdout.readline()
+    if b'char device redirected' in read:
+        read = p.stdout.readline()
+    # Skip passed QEMU warnings, like the following one we see in Ubuntu:
+    # qemu-system-x86_64: warning: TCG doesn't support requested feature: CPUID.01H:ECX.vmx [bit 5]
+    while b'qemu-system-x86_64: warning:' in read:
+        read = p.stdout.readline()
+    if args.print_output:
+        print(strip_special(read), end='')
+        print()
+    # Send the escape char to enter the UEFI shell early
+    p.stdin.write(b'\x1b')
+    p.stdin.flush()
+    # And then run the following three commands from the UEFI shell:
+    # change into the first file system device; install the default
+    # keys and certificates, and reboot
+    p.stdin.write(b'fs0:\r\n')
+    p.stdin.write(b'EnrollDefaultKeys.efi\r\n')
+    p.stdin.write(b'reset -s\r\n')
+    p.stdin.flush()
+    while True:
+        read = p.stdout.readline()
+        if args.print_output:
+            print('OUT: %s' % strip_special(read), end='')
+            print()
+        if b'info: success' in read:
+            break
+    p.wait()
+    if args.print_output:
+        print(strip_special(p.stdout.read()), end='')
+    logging.info('Finished enrollment')
+
+
+def test_keys(args):
+    logging.info('Grabbing test kernel')
+    kernel, kerneltemp = download(args.kernel_url, args.kernel_path,
+                                  'kernel', args.no_download)
+
+    logging.info('Starting verification')
+    try:
+        cmd = generate_qemu_cmd(
+            args,
+            True,
+            '-append', 'console=tty0 console=ttyS0,115200n8',
+            '-kernel', kernel)
+        p = subprocess.Popen(cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT)
+        logging.info('Performing verification')
+        while True:
+            read = p.stdout.readline()
+            if args.print_output:
+                print('OUT: %s' % strip_special(read), end='')
+                print()
+            if b'Secure boot disabled' in read:
+                raise Exception('Secure Boot was disabled')
+            elif b'Secure boot enabled' in read:
+                logging.info('Confirmed: Secure Boot is enabled')
+                break
+            elif b'Kernel is locked down from EFI secure boot' in read:
+                logging.info('Confirmed: Secure Boot is enabled')
+                break
+        p.kill()
+        if args.print_output:
+            print(strip_special(p.stdout.read()), end='')
+        logging.info('Finished verification')
+    finally:
+        if kerneltemp:
+            os.remove(kernel)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('output', help='Filename for output vars file')
+    parser.add_argument('--out-temp', help=argparse.SUPPRESS)
+    parser.add_argument('--force', help='Overwrite existing output file',
+                        action='store_true')
+    parser.add_argument('--print-output', help='Print the QEMU guest output',
+                        action='store_true')
+    parser.add_argument('--verbose', '-v', help='Increase verbosity',
+                        action='count')
+    parser.add_argument('--quiet', '-q', help='Decrease verbosity',
+                        action='count')
+    parser.add_argument('--qemu-binary', help='QEMU binary path',
+                        default='/usr/bin/qemu-system-x86_64')
+    parser.add_argument('--enable-kvm', help='Enable KVM acceleration',
+                        action='store_true')
+    parser.add_argument('--ovmf-binary', help='OVMF secureboot code file',
+                        default='/usr/share/edk2/ovmf/OVMF_CODE.secboot.fd')
+    parser.add_argument('--ovmf-template-vars', help='OVMF empty vars file',
+                        default='/usr/share/edk2/ovmf/OVMF_VARS.fd')
+    parser.add_argument('--uefi-shell-iso', help='Path to uefi shell iso',
+                        default='/usr/share/edk2/ovmf/UefiShell.iso')
+    parser.add_argument('--skip-enrollment',
+                        help='Skip enrollment, only test', action='store_true')
+    parser.add_argument('--skip-testing',
+                        help='Skip testing generated "VARS" file',
+                        action='store_true')
+    parser.add_argument('--kernel-path',
+                        help='Specify a consistent path for kernel')
+    parser.add_argument('--no-download', action='store_true',
+                        help='Never download a kernel')
+    parser.add_argument('--fedora-version',
+                        help='Fedora version to get kernel for checking',
+                        default='27')
+    parser.add_argument('--kernel-url', help='Kernel URL',
+                        default='https://download.fedoraproject.org/pub/fedora'
+                                '/linux/releases/%(version)s/Everything/x86_64'
+                                '/os/images/pxeboot/vmlinuz')
+    parser.add_argument('--disable-smm',
+                        help=('Don\'t restrict varstore pflash writes to '
+                              'guest code that executes in SMM. Use this '
+                              'option only if your OVMF binary doesn\'t have '
+                              'the edk2 SMM driver stack built into it '
+                              '(possibly because your QEMU binary lacks SMM '
+                              'emulation). Note that without restricting '
+                              'varstore pflash writes to guest code that '
+                              'executes in SMM, a malicious guest kernel, '
+                              'used for testing, could undermine Secure '
+                              'Boot.'),
+                        action='store_true')
+    parser.add_argument('--oem-string',
+                        help=('Pass the argument to the guest as a string in '
+                              'the SMBIOS Type 11 (OEM Strings) table. '
+                              'Multiple occurrences of this option are '
+                              'collected into a single SMBIOS Type 11 table. '
+                              'A pure ASCII string argument is strongly '
+                              'suggested.'),
+                        action='append')
+    args = parser.parse_args()
+    args.kernel_url = args.kernel_url % {'version': args.fedora_version}
+
+    validate_args(args)
+    return args
+
+
+def validate_args(args):
+    if (os.path.exists(args.output)
+            and not args.force
+            and not args.skip_enrollment):
+        raise Exception('%s already exists' % args.output)
+
+    if args.skip_enrollment and not os.path.exists(args.output):
+        raise Exception('%s does not yet exist' % args.output)
+
+    verbosity = (args.verbose or 1) - (args.quiet or 0)
+    if verbosity >= 2:
+        logging.basicConfig(level=logging.DEBUG)
+    elif verbosity == 1:
+        logging.basicConfig(level=logging.INFO)
+    elif verbosity < 0:
+        logging.basicConfig(level=logging.ERROR)
+    else:
+        logging.basicConfig(level=logging.WARN)
+
+    if args.skip_enrollment:
+        args.out_temp = args.output
+    else:
+        temped = tempfile.mkstemp(prefix='qosb.', suffix='.vars')
+        os.close(temped[0])
+        args.out_temp = temped[1]
+        logging.debug('Temp output: %s', args.out_temp)
+
+
+def move_to_dest(args):
+    shutil.copy(args.out_temp, args.output)
+    os.remove(args.out_temp)
+
+
+def main():
+    args = parse_args()
+    if not args.skip_enrollment:
+        enroll_keys(args)
+    if not args.skip_testing:
+        test_keys(args)
+    if not args.skip_enrollment:
+        move_to_dest(args)
+        if args.skip_testing:
+            logging.info('Created %s' % args.output)
+        else:
+            logging.info('Created and verified %s' % args.output)
+    else:
+        logging.info('Verified %s', args.output)
+
+
+if __name__ == '__main__':
+    main()
