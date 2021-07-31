@@ -41,7 +41,7 @@ bash build_ovmf.sh -S
 
 built files can be found in `edk2/Build/OvmfX64/DEBUG_GCC5/FV/`, `OVMF_CODE.fd` and `OVMF_VAR.fd` for non-secure boot builds
 
-for secure boot builds, ``OVMF_CODE.fd` and `OVMF_VAR.fd` can be found in `edk2/Build/Ovmf3264/DEBUG_GCC5/FV/`, with an additional `OVMF_VARS.enrolled.fd` with pre-enrolled redhat keys
+for secure boot builds, `OVMF_CODE.fd` and `OVMF_VAR.fd` can be found in `edk2/Build/Ovmf3264/DEBUG_GCC5/FV/`, with an additional `OVMF_VARS.enrolled.fd` with pre-enrolled redhat keys
 
 ### notes about secure boot builds along with intel-gop:
 
