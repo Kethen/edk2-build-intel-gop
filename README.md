@@ -56,9 +56,14 @@ for example, a kabylake lenovo insydeh20 bios
 
 IntelGopDriver.efi:
 
+if the GUID was not identified by UEFITools, try unicode text searching `Intel(R) Gop Driver`, or hex searching `4900 6e00 7400 6500 6c00 2800 5200 2900 2000 4700 4f00 5000 2000 4400 7200 6900 7600 6500 7200`
+
 ![image](https://user-images.githubusercontent.com/22017945/127104602-477dec76-0081-4b30-82b8-3d7e48196a48.png)
 
-Vbt.bin
+Vbt.bin:
+
+if the GUID was not identified by UEFITools, try non unicode text searching `$VBT`, or hex searching `2456 4254`
+the file is usually began with non unicode `$VBT <codename>`, such as `$VBT SKYLAKE` 
 
 ![image](https://user-images.githubusercontent.com/22017945/127104651-6466ab8d-adc6-4856-b1a7-90cb4cf96273.png)
 
