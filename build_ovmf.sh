@@ -231,6 +231,7 @@ podman run \
     --rm \
     -w $PWD/edk2 \
     -v $PWD:$PWD \
+    --security-opt label=disable \
     ${podman_image_name} \
     /bin/bash -c "source edksetup.sh && make -C BaseTools && build $OVMF_FLAGS $SECURE_BOOT"
 
