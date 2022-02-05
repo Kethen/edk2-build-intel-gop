@@ -63,6 +63,7 @@ usage()
     echo "$0 [-v ver] [-i] [-s] [-h]"
     echo "  -b branch/tag: checkout branch/tag instead of leaving it as default"
     echo "  -i:     Delete the existing docker image ${docker_image_name} and re-create it"
+    echo "  -I image size: image size in MB"
     echo "  -s:     Delete the existing edk2 source code and re-download it"
     echo "  -S:     Build vanilla secure boot ovmf instead of intel gop"
     echo "  -h:     Show this help"
@@ -71,8 +72,9 @@ usage()
 
 re_download=0
 re_create_image=0
+image_size=4
 
-while getopts "hisb:S" opt
+while getopts "hisb:SI:" opt
 do
     case "${opt}" in
         h)
@@ -89,6 +91,9 @@ do
             ;;
         S)
             secureboot=yes
+            ;;
+        I)
+            image_size=${OPTARG}
             ;;
         ?)
             echo "${OPTARG}"
@@ -209,7 +214,7 @@ sed -i "s:^TOOL_CHAIN_TAG\s*=\s*\w*:TOOL_CHAIN_TAG        = GCC5:g" Conf/target.
 cd ..
 
 OVMF_FLAGS="-DNETWORK_IP6_ENABLE -DNETWORK_HTTP_BOOT_ENABLE -DNETWORK_TLS_ENABLE"
-OVMF_FLAGS="$OVMF_FLAGS -DFD_SIZE_4MB"
+OVMF_FLAGS="$OVMF_FLAGS -DFD_SIZE_${image_size}MB"
 #OVMF_FLAGS="$OVMF_FLAGS -DDEBUG_ON_SERIAL_PORT=TRUE"
 
 
